@@ -48,6 +48,8 @@ namespace application {
         glm::vec3 object_scale = glm::vec3(1.0f);
         glm::vec3 object_color(0.2f, 0.5f, 1.0f);
 
+        glm::vec3 first_object_position = glm::vec3(0.0f);
+        glm::vec3 first_object_rotation = glm::vec3(0.0f);
         glm::vec3 second_object_position = glm::vec3(0.0f);
         glm::vec3 second_object_rotation = glm::vec3(0.0f);
 
@@ -56,6 +58,10 @@ namespace application {
         bool animation_enabled = true;
         float animation_speed = 1.0f;
         float trajectory_radius = 1.5f;
+        constexpr double pi = 3.14159265358979323846;
+        double animation_phase = 0.0;
+        double previous_update_time = 0.0;
+        bool has_previous_update_time = false;
 
         std::vector<Vertex> vertices;
 
@@ -338,9 +344,15 @@ namespace application {
 
             const VkShaderModule fragment_shader = createShaderModule(fragment_shader_code);
 
+            const auto destroy_shader_modules = [&]() {
+                vkDestroyShaderModule(graphics::internal::context.device, vertex_shader, nullptr);
+                vkDestroyShaderModule(graphics::internal::context.device, fragment_shader, nullptr);
+            };
+
             if (vertex_shader == VK_NULL_HANDLE ||
                 fragment_shader == VK_NULL_HANDLE) {
                 std::cerr << "Failed to create shader modules\n";
+                destroy_shader_modules();
                 return false;
             }
 
@@ -464,6 +476,7 @@ namespace application {
                 nullptr,
                 &pipeline_layout) != VK_SUCCESS) {
                 std::cerr << "Failed to create pipeline layout\n";
+                destroy_shader_modules();
                 return false;
             }
 
@@ -492,15 +505,7 @@ namespace application {
                 nullptr,
                 &graphics_pipeline);
 
-            vkDestroyShaderModule(
-                graphics::internal::context.device,
-                vertex_shader,
-                nullptr);
-
-            vkDestroyShaderModule(
-                graphics::internal::context.device,
-                fragment_shader,
-                nullptr);
+            destroy_shader_modules();
 
             if (result != VK_SUCCESS) {
                 std::cerr << "Failed to create graphics pipeline\n";
@@ -549,19 +554,23 @@ namespace application {
             );
 
             glm::mat4 projection;
+            const auto extent = graphics::internal::context.swapchain_extent;
+            const float aspect = extent.width != 0 && extent.height != 0
+                ? static_cast<float>(extent.width) / static_cast<float>(extent.height)
+                : 1.0f;
 
             if (use_perspective) {
                 projection = glm::perspective(
                     glm::radians(45.0f),
-                    1.0f,
+                    aspect,
                     0.1f,
                     100.0f
                 );
             }
             else {
                 projection = glm::ortho(
-                    -2.0f,
-                    2.0f,
+                    -2.0f * aspect,
+                    2.0f * aspect,
                     -2.0f,
                     2.0f,
                     0.1f,
@@ -577,18 +586,23 @@ namespace application {
     } // namespace
 
     bool initialize() {
+        animation_phase = 0.0;
+        has_previous_update_time = false;
 
         createCone();
 
         if (!createVertexBuffer()) {
+            shutdown();
             return false;
         }
 
         if (!createDescriptorResources()) {
+            shutdown();
             return false;
         }
 
         if (!createPipeline()) {
+            shutdown();
             return false;
         }
 
@@ -605,6 +619,7 @@ namespace application {
                 context.device,
                 graphics_pipeline,
                 nullptr);
+            graphics_pipeline = VK_NULL_HANDLE;
         }
 
         if (pipeline_layout != VK_NULL_HANDLE) {
@@ -612,6 +627,7 @@ namespace application {
                 context.device,
                 pipeline_layout,
                 nullptr);
+            pipeline_layout = VK_NULL_HANDLE;
         }
 
         if (descriptor_pool != VK_NULL_HANDLE) {
@@ -619,6 +635,7 @@ namespace application {
                 context.device,
                 descriptor_pool,
                 nullptr);
+            descriptor_pool = VK_NULL_HANDLE;
         }
 
         if (descriptor_set_layout != VK_NULL_HANDLE) {
@@ -626,6 +643,7 @@ namespace application {
                 context.device,
                 descriptor_set_layout,
                 nullptr);
+            descriptor_set_layout = VK_NULL_HANDLE;
         }
 
         if (vertex_buffer != VK_NULL_HANDLE) {
@@ -633,6 +651,8 @@ namespace application {
                 context.allocator,
                 vertex_buffer,
                 vertex_buffer_allocation);
+            vertex_buffer = VK_NULL_HANDLE;
+            vertex_buffer_allocation = VK_NULL_HANDLE;
         }
 
         for (size_t i = 0; i < uniform_buffers.size(); ++i) {
@@ -641,11 +661,21 @@ namespace application {
                     context.allocator,
                     uniform_buffers[i],
                     uniform_buffer_allocations[i]);
+                uniform_buffers[i] = VK_NULL_HANDLE;
+                uniform_buffer_allocations[i] = VK_NULL_HANDLE;
             }
         }
+        descriptor_sets.fill(VK_NULL_HANDLE);
     }
 
     void update(double time) {
+        double delta_time = has_previous_update_time ? time - previous_update_time : 0.0;
+        if (delta_time < 0.0) {
+            delta_time = 0.0;
+        }
+        previous_update_time = time;
+        has_previous_update_time = true;
+
         ImGui::Begin("Cone controls");
 
         ImGui::Checkbox("Perspective", &use_perspective);
@@ -653,13 +683,13 @@ namespace application {
         ImGui::Separator();
 
         ImGui::DragFloat3(
-            "Position",
+            "Position offset",
             &object_position.x,
             0.01f
         );
 
         ImGui::DragFloat3(
-            "Rotation",
+            "Rotation offset (rad)",
             &object_rotation.x,
             0.01f
         );
@@ -700,18 +730,22 @@ namespace application {
         );
 
         if (animation_enabled) {
-            const float animation_time = static_cast<float>(time * animation_speed);
-
-            object_position.x = trajectory_radius * std::cos(animation_time);
-            object_position.z = trajectory_radius * std::sin(animation_time);
-            object_position.y = 0.5f * std::sin(2.0f * animation_time);
-            object_rotation.y = animation_time;
-            const float second_animation_time = animation_time + 3.14159265358979323846f;
-            second_object_position.x = trajectory_radius * std::cos(second_animation_time);
-            second_object_position.z = trajectory_radius * std::sin(second_animation_time);
-            second_object_position.y = 0.5f * std::sin(2.0f * second_animation_time);
-            second_object_rotation.y = second_animation_time;
+            animation_phase = std::fmod(
+                animation_phase + delta_time * animation_speed, 2.0 * pi);
         }
+
+        const auto trajectory_position = [](double phase) {
+            return glm::vec3(
+                static_cast<float>(trajectory_radius * std::cos(phase)),
+                static_cast<float>(0.5 * std::sin(2.0 * phase)),
+                static_cast<float>(trajectory_radius * std::sin(phase)));
+        };
+
+        first_object_position = object_position + trajectory_position(animation_phase);
+        first_object_rotation = object_rotation + glm::vec3(0.0f, static_cast<float>(animation_phase), 0.0f);
+        const double second_animation_phase = animation_phase + pi;
+        second_object_position = trajectory_position(second_animation_phase);
+        second_object_rotation = glm::vec3(0.0f, static_cast<float>(second_animation_phase), 0.0f);
 
         ImGui::End();
     }
@@ -802,7 +836,7 @@ namespace application {
 
         // Первый конус
         ObjectData first_object{};
-        first_object.mvp = getMvp(object_position, object_rotation, object_scale);
+        first_object.mvp = getMvp(first_object_position, first_object_rotation, object_scale);
         first_object.color = glm::vec4(object_color, 1.0f);
 
         updateUniformBuffer(0, first_object);
